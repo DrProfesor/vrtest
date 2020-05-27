@@ -4,6 +4,7 @@ import "core:sys/win32"
 import "core:strings"
 import "core:fmt"
 import "core:math/linalg"
+import "core:math"
 
 import dx "shared:odin-dx"
 import vr "shared:odin-openvr"
@@ -185,20 +186,28 @@ main :: proc() {
 
 	for {
 		vr_compositor.WaitGetPoses(&tracked_device_poses[0], vr.k_unMaxTrackedDeviceCount, nil, 0);
-		valid_poses = 0;
-		clear(&vr_models);
 		for nDevice in 0..16 {
 			tracked_device := tracked_device_poses[nDevice];
 			if tracked_device.bPoseIsValid {
-				valid_poses += 1;
-				device_poses[nDevice] = linalg.matrix4_inverse(convert_vr_matrix_to_odin(tracked_device.mDeviceToAbsoluteTracking));
-				model, ok := load_vr_model(cast(u32)nDevice);
-				if ok do append(&vr_models, model);
+				device_poses[nDevice] = convert_vr_matrix_to_odin(tracked_device.mDeviceToAbsoluteTracking);
+				
+				exists := false;
+				for em in vr_models {
+					if em.device_index == u32(nDevice) {
+						exists = true;
+						break;
+					}
+				}
+
+				if !exists {
+					model, ok := load_vr_model(cast(u32)nDevice);
+					if ok do append(&vr_models, model);
+				}
 			}
 		}
 
 		if tracked_device_poses[vr.k_unTrackedDeviceIndex_Hmd].bPoseIsValid {
-			hmd_position_matrix = device_poses[vr.k_unTrackedDeviceIndex_Hmd];
+			hmd_position_matrix = linalg.matrix4_inverse(device_poses[vr.k_unTrackedDeviceIndex_Hmd]);
 		}
 
 		// TODO depth
@@ -211,15 +220,17 @@ main :: proc() {
 	    ctxt.ClearRenderTargetView(ctxt, right_eye.render_target, {0.1,0.5,0.8,1});
 	    render_scene(right_eye.position, right_eye.projection);
 
-		ctxt.OMSetRenderTargets(ctxt, 1, &render_target_view, depth_stencil_view);
-	    ctxt.ClearDepthStencilView(ctxt, depth_stencil_view, dx.D3D11_CLEAR_DEPTH | dx.D3D11_CLEAR_STENCIL, 1.0, 0);
+		// ctxt.OMSetRenderTargets(ctxt, 1, &render_target_view, depth_stencil_view);
+	 //    ctxt.ClearDepthStencilView(ctxt, depth_stencil_view, dx.D3D11_CLEAR_DEPTH | dx.D3D11_CLEAR_STENCIL, 1.0, 0);
 	    ctxt.OMSetRenderTargets(ctxt, 1, &render_target_view, nil);
 	    ctxt.ClearRenderTargetView(ctxt, render_target_view, {0.1,0.5,0.8,1});
 	    render_scene(right_eye.position, right_eye.projection);
 
 	    swap_chain.Present(swap_chain, 0, 0);
 
+		left_vr_texture := vr.Texture_t{texture, vr.ETextureType_TextureType_DirectX, vr.EColorSpace_ColorSpace_Gamma};
 		err := vr_compositor.Submit(vr.EVREye_Eye_Left,  &left_eye.vr_texture,  &bounds, vr.EVRSubmitFlags_Submit_Default);
+		right_vr_texture := vr.Texture_t{texture, vr.ETextureType_TextureType_DirectX, vr.EColorSpace_ColorSpace_Gamma};
 		err  = vr_compositor.Submit(vr.EVREye_Eye_Right, &right_eye.vr_texture, &bounds, vr.EVRSubmitFlags_Submit_Default);
 		
 		message: win32.Msg;
@@ -247,6 +258,9 @@ render_scene :: proc(pos, proj: linalg.Matrix4) {
 		ctxt.IASetInputLayout(ctxt, model.vert_layout);
 		ctxt.IASetPrimitiveTopology(ctxt, dx.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
+		ctxt.PSSetSamplers(ctxt, 0, 1, &model.sampler);
+		ctxt.PSSetShaderResources(ctxt, 0, 1, &model.shader_resource);
+
 		cbo: CBObj;
 		cbo.vp = linalg.mul(linalg.mul(proj, pos),hmd_position_matrix); 
 		cbo.m = device_poses[model.device_index];
@@ -263,15 +277,23 @@ controller_right_id := -1;
 
 VR_Model :: struct {
 	device_name: [1024]u8,
+	
 	render_model: ^vr.RenderModel_t,
 	render_model_texture: ^vr.RenderModel_TextureMap_t,
+	
 	vert_buffer: ^dx.ID3D11Buffer,
 	ind_buffer: ^dx.ID3D11Buffer,
 	vert_layout: ^dx.ID3D11InputLayout,
+	
+	shader_resource: ^dx.ID3D11ShaderResourceView,
+	texture: ^dx.ID3D11Texture2D,
+	sampler: ^dx.ID3D11SamplerState,
+	
 	role: u32,
 	stride : u32,
 	offset : u32,
 	ind_count: u32,
+	
 	device_index: vr.TrackedDeviceIndex_t,
 }
 
@@ -341,8 +363,44 @@ load_vr_model :: proc(di: vr.TrackedDeviceIndex_t) -> (VR_Model, bool) {
 	ind_buffer_data.pSysMem = render_model.rIndexData;
 
 	device.CreateBuffer(device, &index_buffer_desc, &ind_buffer_data, &ind_buffer);
-
 	device.CreateInputLayout(device, &layout[0], cast(u32) len(layout), VS_Buffer.GetBufferPointer(VS_Buffer), VS_Buffer.GetBufferSize(VS_Buffer), &vert_layout);
+
+	texture_desc: dx.D3D11_TEXTURE2D_DESC;
+	texture_desc.Width = u32(render_model_texture.unWidth);
+	texture_desc.Height = u32(render_model_texture.unHeight);
+	texture_desc.MipLevels = 1;
+	texture_desc.ArraySize = 1;
+	texture_desc.Format = dx.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	texture_desc.SampleDesc.Count = 1;
+	texture_desc.Usage = dx.D3D11_USAGE_DEFAULT;
+	texture_desc.BindFlags = dx.D3D11_BIND_SHADER_RESOURCE;
+	
+	texture_data: dx.D3D11_SUBRESOURCE_DATA;
+	texture_data.pSysMem = render_model_texture.rubTextureMapData;
+	texture_data.SysMemPitch = u32(render_model_texture.unWidth);
+	
+	device.CreateTexture2D(device, &texture_desc, &texture_data, &texture);
+
+	desc := dx.D3D11_SHADER_RESOURCE_VIEW_DESC {
+		dx.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+		dx.D3D11_SRV_DIMENSION_TEXTURE2D,
+		{},
+	};
+	desc.Texture2D = dx.D3D11_TEX2D_SRV { 0, 1 };
+	device.CreateShaderResourceView(device, cast(^dx.ID3D11Resource)texture, &desc, &shader_resource);
+
+	sampler_desc: dx.D3D11_SAMPLER_DESC;
+	sampler_desc.Filter = dx.D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sampler_desc.AddressU = dx.D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampler_desc.AddressV = dx.D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampler_desc.AddressW = dx.D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampler_desc.MipLODBias = 0.0;
+	sampler_desc.MaxAnisotropy = 1;
+	sampler_desc.ComparisonFunc= dx.D3D11_COMPARISON_NEVER;
+	sampler_desc.MinLOD = math.F32_MIN;
+	sampler_desc.MaxLOD = math.F32_MAX;
+
+	device.CreateSamplerState(device, &sampler_desc, &sampler);
 
 	return vr_model, true;
 }
@@ -360,7 +418,7 @@ create_eye :: proc(device: ^dx.ID3D11Device, left: bool, width, height: u32) -> 
 	texture_desc.MipLevels = 1;
 	texture_desc.ArraySize = 1;
 	texture_desc.Format = dx.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-	texture_desc.SampleDesc.Count = 4;
+	texture_desc.SampleDesc.Count = 1;
 	texture_desc.Usage = dx.D3D11_USAGE_DEFAULT;
 	texture_desc.BindFlags = dx.D3D11_BIND_RENDER_TARGET | dx.D3D11_BIND_SHADER_RESOURCE;
 
@@ -381,14 +439,11 @@ create_eye :: proc(device: ^dx.ID3D11Device, left: bool, width, height: u32) -> 
 
 	device.CreateShaderResourceView(device, cast(^dx.ID3D11Resource)texture, &shader_resource_desc, &shader_resource);
 
-	vr_texture = vr.Texture_t{texture, vr.ETextureType_TextureType_DirectX, vr.EColorSpace_ColorSpace_Gamma};
-
 	return eye;
 }
 
 Eye :: struct {
 	is_left: bool,
-	vr_texture: vr.Texture_t,
 	shader_resource: ^dx.ID3D11ShaderResourceView,
 	render_target: ^dx.ID3D11RenderTargetView,
 	texture: ^dx.ID3D11Texture2D,
